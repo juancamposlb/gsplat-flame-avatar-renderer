@@ -529,7 +529,8 @@ export class Viewer {
       this.renderer = new WebGLRenderer({
         antialias: false,
         precision: 'highp',
-        canvas: this.canvas
+        canvas: this.canvas,
+        alpha: true
       });
       this.renderer.setPixelRatio(this.devicePixelRatio);
       this.renderer.autoClear = true;
