@@ -297,6 +297,7 @@ export class GaussianSplatRenderer {
             try {
                 
                 if (options.irisOcclusionConfig) {
+                    logger.debug('Iris occlusion configuration provided via options, using that instead of loading from ZIP');
                     irisOcclusionConfig = options.irisOcclusionConfig; // Override with options if provided
                 } else {
                     irisOcclusionConfig = await renderer._loadJsonFromZip(fileName + '/iris_occlusion.json');
