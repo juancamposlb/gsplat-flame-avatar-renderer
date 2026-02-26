@@ -295,7 +295,12 @@ export class GaussianSplatRenderer {
             logger.debug('Checking for iris_occlusion.json');
             let irisOcclusionConfig = null;
             try {
-                irisOcclusionConfig = await renderer._loadJsonFromZip(fileName + '/iris_occlusion.json');
+                
+                if (options.irisOcclusionConfig) {
+                    irisOcclusionConfig = options.irisOcclusionConfig; // Override with options if provided
+                } else {
+                    irisOcclusionConfig = await renderer._loadJsonFromZip(fileName + '/iris_occlusion.json');
+                }
                 if (irisOcclusionConfig) {
                     logger.info('Iris occlusion configuration loaded', {
                         rightIrisRanges: irisOcclusionConfig.right_iris?.length ?? 0,
