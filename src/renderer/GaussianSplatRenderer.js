@@ -45,7 +45,7 @@ import {
     validateCallback
 } from '../utils/ValidationUtils.js';
 import { BlobUrlManager } from '../utils/BlobUrlManager.js';
-import { tempVector3A } from '../utils/ObjectPool.js';
+import { tempVector3A, tempVector3B, tempQuaternionA } from '../utils/ObjectPool.js';
 
 // Create logger for this module
 const logger = getLogger('GaussianSplatRenderer');
@@ -87,6 +87,14 @@ export class GaussianSplatRenderer {
      * @param {Function} [options.loadProgress] - Load progress callback (0-1)
      * @param {Function} [options.getChatState] - Chat state provider function
      * @param {Function} [options.getExpressionData] - Expression data provider function
+     * @param {Function} [options.getNeckPose] - Per-frame neck/head pose override.
+     *   Called every frame after mixer.update(). Return value shape:
+     *     { neck?: [x,y,z], rotation?: [x,y,z] }
+     *   Each is an axis-angle vector (magnitude = angle in radians) applied to the
+     *   matching FLAME bone (neck = bones[1], rotation = root 'hip' = bones[0]).
+     *   Returning null/undefined leaves the baked animation untouched.
+     *   Override is SET (replaces clip rotation for that bone). Mix with the clip
+     *   on the caller side if needed.
      * @param {string} [options.backgroundColor] - Background color (hex string)
      * @returns {Promise<GaussianSplatRenderer>} Renderer instance
      * @throws {ValidationError} If parameters are invalid
@@ -113,6 +121,9 @@ export class GaussianSplatRenderer {
             }
             if (options.getExpressionData) {
                 validateCallback(options.getExpressionData, 'options.getExpressionData', false);
+            }
+            if (options.getNeckPose) {
+                validateCallback(options.getNeckPose, 'options.getNeckPose', false);
             }
             if (options.backgroundColor) {
                 validateHexColor(options.backgroundColor, 'options.backgroundColor');
@@ -290,6 +301,7 @@ export class GaussianSplatRenderer {
             // Store callbacks
             renderer.getChatState = options?.getChatState;
             renderer.getExpressionData = options?.getExpressionData;
+            renderer.getNeckPose = options?.getNeckPose;
 
             // Load iris occlusion configuration BEFORE creating viewer (optional)
             logger.debug('Checking for iris_occlusion.json');
@@ -496,6 +508,11 @@ export class GaussianSplatRenderer {
         this.motioncfg = null;
         this.getChatState = null;
         this.getExpressionData = null;
+        this.getNeckPose = null;
+
+        // Cache for skeleton bones used by procedural pose override.
+        // Populated lazily on first override call after loadModel().
+        this._overridableBones = null;
 
         logger.debug('GaussianSplatRenderer instance created');
     }
@@ -569,6 +586,8 @@ export class GaussianSplatRenderer {
         this.motioncfg = null;
         this.getChatState = null;
         this.getExpressionData = null;
+        this.getNeckPose = null;
+        this._overridableBones = null;
         this.zipUrls = null;
 
         // Mark as disposed
@@ -592,6 +611,9 @@ export class GaussianSplatRenderer {
      */
     disposeModel() {
         logger.debug('Disposing model resources');
+
+        // Invalidate procedural pose bone cache (bones belong to the about-to-be-freed viewer)
+        this._overridableBones = null;
 
         // Dispose animation mixer
         if (this.mixer) {
@@ -756,6 +778,13 @@ export class GaussianSplatRenderer {
                 const mixerUpdateDelta = this.clock.getDelta();
                 this.mixer.update(mixerUpdateDelta);
 
+                // Procedural neck/head pose override.
+                // Runs AFTER mixer.update() so caller wins vs baked clip; runs BEFORE
+                // viewer.update() so the splat skinning sees the overridden bones.
+                if (this.getNeckPose) {
+                    this._applyNeckPose(this.getNeckPose());
+                }
+
                 // Apply motion config offsets/scales
                 if (this.motioncfg) {
                     for (const morphTarget in this.expressionData) {
@@ -802,6 +831,57 @@ export class GaussianSplatRenderer {
         if (typeof value !== 'string') return false;
         const hexColorRegex = /^(#|0x)[0-9A-Fa-f]{6}$/i;
         return hexColorRegex.test(value);
+    }
+
+    /**
+     * Resolve and cache the FLAME bones eligible for procedural pose override.
+     * Walks the skeleton starting at `viewer.boneRoot` (the 'hip' bone) once and
+     * maps bone names to Bone instances. Returns null until the model is loaded.
+     * @private
+     * @returns {Object<string, import('three').Bone>|null}
+     */
+    _getOverridableBones() {
+        if (this._overridableBones) return this._overridableBones;
+        const root = this.viewer?.boneRoot;
+        if (!root) return null;
+        const map = {};
+        root.traverse((node) => {
+            if (node.isBone) map[node.name] = node;
+        });
+        this._overridableBones = map;
+        return map;
+    }
+
+    /**
+     * Apply axis-angle bone overrides from the getNeckPose callback.
+     * Uses module-level singleton Vector3/Quaternion to stay allocation-free
+     * (this runs every frame at 30 Hz).
+     * @private
+     * @param {{neck?: number[], rotation?: number[]} | null | undefined} pose
+     */
+    _applyNeckPose(pose) {
+        if (!pose) return;
+        const bones = this._getOverridableBones();
+        if (!bones) return;
+
+        const setAxisAngle = (boneName, axisAngle) => {
+            if (!Array.isArray(axisAngle) || axisAngle.length < 3) return;
+            const bone = bones[boneName];
+            if (!bone) return;
+            tempVector3B.set(axisAngle[0], axisAngle[1], axisAngle[2]);
+            const angle = tempVector3B.length();
+            if (angle > 1e-7) {
+                tempVector3B.normalize();
+                tempQuaternionA.setFromAxisAngle(tempVector3B, angle);
+            } else {
+                tempQuaternionA.set(0, 0, 0, 1);
+            }
+            bone.quaternion.copy(tempQuaternionA);
+        };
+
+        setAxisAngle('neck', pose.neck);
+        // FLAME root bone in skin.glb is named 'hip' per the OAC contract.
+        setAxisAngle('hip', pose.rotation);
     }
 
     /**
