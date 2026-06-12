@@ -79,8 +79,19 @@ export enum WebXRMode {
  * desired.
  */
 export interface NeckPoseOverride {
-    neck?: [number, number, number];
-    rotation?: [number, number, number];
+    /**
+     * Each key is a bone name (looked up in the skin.glb skeleton). Value is
+     * Euler 'YXZ' angles in radians [pitch, yaw, roll]. The renderer iterates
+     * all own keys and applies setFromEuler per bone.
+     *
+     * Legacy aliases preserved:
+     *   `rotation` -> bone 'hip' (global head/torso tilt)
+     *
+     * Examples:
+     *   { neck: [0, 0.05, 0] }                          // FLAME 5-bone rig
+     *   { head: [0.1, 0.05, 0], neckUpper: [0.05, 0.025, 0] }  // DAZ chain
+     */
+    [boneName: string]: [number, number, number] | undefined;
 }
 
 /**

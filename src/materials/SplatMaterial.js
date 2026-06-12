@@ -40,9 +40,12 @@ export class SplatMaterial {
         uniform int gaussianSplatCount;
         uniform int bsCount;
         uniform float headBoneIndex;
+        uniform float useHeadOnlySkinning;
+        uniform float debugColorByBone;
         #ifdef USE_SKINNING
-            attribute vec4 skinIndex;
-            attribute vec4 skinWeight;
+            uniform highp usampler2D skinIndexTexture;
+            uniform highp usampler2D skinWeightTexture;
+            uniform vec2 skinDataTextureSize;
         #endif
     `;
 
@@ -253,18 +256,21 @@ export class SplatMaterial {
 
 
             #ifdef USE_SKINNING
-                mat4 boneMatX = getBoneMatrix0( skinIndex.x );
-                mat4 boneMatY = getBoneMatrix0( skinIndex.y );
-                mat4 boneMatZ = getBoneMatrix0( skinIndex.z );
-                mat4 boneMatW = getBoneMatrix0( skinIndex.w );
-            #endif
-            #ifdef USE_SKINNING
-                mat4 skinMatrix = mat4( 0.0 );
-                skinMatrix += skinWeight.x * boneMatX;
-                skinMatrix += skinWeight.y * boneMatY;
-                skinMatrix += skinWeight.z * boneMatZ;
-                skinMatrix += skinWeight.w * boneMatW;
-                // skinMatrix = bindMatrixInverse * skinMatrix * bindMatrix;
+                uint _skinRawIdx = uint(splatIndex);
+                int _skinTexX = int(_skinRawIdx % uint(skinDataTextureSize.x));
+                int _skinTexY = int(_skinRawIdx / uint(skinDataTextureSize.x));
+                uvec4 _skinIdxs = texelFetch(skinIndexTexture, ivec2(_skinTexX, _skinTexY), 0);
+                uvec4 _skinWsRaw = texelFetch(skinWeightTexture, ivec2(_skinTexX, _skinTexY), 0);
+                vec4 _skinWs = vec4(
+                    uintBitsToFloat(_skinWsRaw.x),
+                    uintBitsToFloat(_skinWsRaw.y),
+                    uintBitsToFloat(_skinWsRaw.z),
+                    uintBitsToFloat(_skinWsRaw.w)
+                );
+                mat4 boneMatX = getBoneMatrix0( float(_skinIdxs.x) );
+                mat4 boneMatY = getBoneMatrix0( float(_skinIdxs.y) );
+                mat4 boneMatZ = getBoneMatrix0( float(_skinIdxs.z) );
+                mat4 boneMatW = getBoneMatrix0( float(_skinIdxs.w) );
             #endif
             vec3 transformed = vec3(splatCenter.xyz);
             #ifdef USE_SKINNING
@@ -272,20 +278,15 @@ export class SplatMaterial {
                 vec4 skinVertex = vec4( transformed, 1.0 );
 
                 vec4 skinned = vec4( 0.0 );
-                // There is an offset between the Gaussian point and the mesh vertex,
-                // which will cause defects in the skeletal animation driving the Gaussian point. 
-                //In order to circumvent this problem, only the head bone(index is 110 currently) is used to drive
-
-                if (headBoneIndex >= 0.0)
-                {
+                if (useHeadOnlySkinning > 0.5 && headBoneIndex >= 0.0) {
                     mat4 boneMat = getBoneMatrix0( headBoneIndex );
                     skinned += boneMat * skinVertex * 1.0;
+                } else {
+                    skinned += boneMatX * skinVertex * _skinWs.x;
+                    skinned += boneMatY * skinVertex * _skinWs.y;
+                    skinned += boneMatZ * skinVertex * _skinWs.z;
+                    skinned += boneMatW * skinVertex * _skinWs.w;
                 }
-
-                // skinned += boneMatX * skinVertex * skinWeight.x;
-                // skinned += boneMatY * skinVertex * skinWeight.y;
-                // skinned += boneMatZ * skinVertex * skinWeight.z;
-                // skinned += boneMatW * skinVertex * skinWeight.w;
 
                 // transformed = ( bindMatrixInverse * skinned ).xyz;
                 transformed = skinned.xyz;
@@ -383,6 +384,26 @@ export class SplatMaterial {
             vSplatIndex = vec2(splatIndex, splatIndex);
 
             vColor = uintToRGBAVec(sampledCenterColor.r);
+
+            #ifdef USE_SKINNING
+            if (debugColorByBone > 0.5) {
+                float maxW = max(max(_skinWs.x, _skinWs.y), max(_skinWs.z, _skinWs.w));
+                float domIdx = -1.0;
+                if (_skinWs.x >= maxW)      domIdx = float(_skinIdxs.x);
+                else if (_skinWs.y >= maxW) domIdx = float(_skinIdxs.y);
+                else if (_skinWs.z >= maxW) domIdx = float(_skinIdxs.z);
+                else if (_skinWs.w >= maxW) domIdx = float(_skinIdxs.w);
+
+                if (domIdx == 110.0)      vColor.rgb = vec3(1.0, 0.0, 0.0); // head -> RED
+                else if (domIdx == 109.0) vColor.rgb = vec3(0.0, 1.0, 0.0); // neckUpper -> GREEN
+                else if (domIdx == 108.0) vColor.rgb = vec3(0.0, 0.4, 1.0); // neckLower -> BLUE
+                else if (domIdx == 47.0)  vColor.rgb = vec3(1.0, 1.0, 0.0); // chestUpper -> YELLOW
+                else if (domIdx == 48.0)  vColor.rgb = vec3(0.0, 1.0, 1.0); // lCollar -> CYAN
+                else if (domIdx == 78.0)  vColor.rgb = vec3(1.0, 0.0, 1.0); // rCollar -> MAGENTA
+                else                       vColor.rgb = vec3(0.5, 0.5, 0.5); // other -> GRAY
+                vColor.a = 1.0;
+            }
+            #endif
         `;
 
         // Proceed to sampling and rendering 1st degree spherical harmonics
@@ -750,6 +771,26 @@ export class SplatMaterial {
             'headBoneIndex': {
                 'type': 'f',
                 'value': -1.0
+            },
+            'useHeadOnlySkinning': {
+                'type': 'f',
+                'value': 0.0
+            },
+            'debugColorByBone': {
+                'type': 'f',
+                'value': 0.0
+            },
+            'skinIndexTexture': {
+                'type': 't',
+                'value': null
+            },
+            'skinWeightTexture': {
+                'type': 't',
+                'value': null
+            },
+            'skinDataTextureSize': {
+                'type': 'v2',
+                'value': new Vector2(512, 512)
             },
             'eyeBlinkLeft': {
                 'type': 'f',
