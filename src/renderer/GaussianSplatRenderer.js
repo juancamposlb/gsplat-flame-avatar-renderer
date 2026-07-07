@@ -86,6 +86,19 @@ const animationConfig = {
     other: []
 };
 
+// Camera-anchored gaze.
+// cal: eye-morph rotation scales in degrees per unit of morph influence,
+// measured from the mesh (morph displacement ÷ eyeball radius). The rig's
+// morphs are asymmetric (out ≠ in), so the abducting and adducting eye need
+// different scales to rotate the same physical angle.
+// gains: empirical sign/strength of the head-compensation term — flip to -1
+// if a live test shows the eyes following the head instead of holding camera.
+const GAZE_LOOKAT = {
+    cal: { out: 21.4, in: 9.6, up: 14.2, down: 11.9 },
+    gainYaw: 1.0,
+    gainPitch: 1.0,
+};
+
 /**
  * GaussianSplatRenderer - Main rendering class
  */
@@ -108,6 +121,15 @@ export class GaussianSplatRenderer {
      *   Returning null/undefined leaves the baked animation untouched.
      *   Override is SET (replaces clip rotation for that bone). Mix with the clip
      *   on the caller side if needed.
+     * @param {Function} [options.getGazeOffset] - Camera-anchored gaze (look-at).
+     *   Called every frame after the neck pose is applied. When provided, the
+     *   renderer OWNS the 8 eyeLook* morphs: it solves the eye rotation needed
+     *   to keep gaze on the CAMERA given the head bone's actual world pose
+     *   (baked clip + procedural delta), then adds the returned behavioral
+     *   offset { yawDeg, pitchDeg } (0,0 = mutual gaze at camera; saccades /
+     *   aversions are expressed as offsets). Return null to skip for a frame
+     *   (widget-supplied eyeLook* values pass through). Omit the option
+     *   entirely for legacy behavior (no look-at, eyeLook* untouched).
      * @param {string} [options.backgroundColor] - Background color (hex string)
      * @returns {Promise<GaussianSplatRenderer>} Renderer instance
      * @throws {ValidationError} If parameters are invalid
@@ -137,6 +159,9 @@ export class GaussianSplatRenderer {
             }
             if (options.getNeckPose) {
                 validateCallback(options.getNeckPose, 'options.getNeckPose', false);
+            }
+            if (options.getGazeOffset) {
+                validateCallback(options.getGazeOffset, 'options.getGazeOffset', false);
             }
             if (options.backgroundColor) {
                 validateHexColor(options.backgroundColor, 'options.backgroundColor');
@@ -315,6 +340,7 @@ export class GaussianSplatRenderer {
             renderer.getChatState = options?.getChatState;
             renderer.getExpressionData = options?.getExpressionData;
             renderer.getNeckPose = options?.getNeckPose;
+            renderer.getGazeOffset = options?.getGazeOffset;
 
             // Load iris occlusion configuration BEFORE creating viewer (optional)
             logger.debug('Checking for iris_occlusion.json');
@@ -798,6 +824,14 @@ export class GaussianSplatRenderer {
                     this._applyNeckPose(this.getNeckPose());
                 }
 
+                // Camera-anchored gaze (look-at). Runs AFTER the neck pose so it
+                // sees the FINAL head orientation for this frame (clip + delta),
+                // and BEFORE setExpression() so its eyeLook values are what the
+                // morphs receive.
+                if (this.getGazeOffset) {
+                    this._applyCameraGaze();
+                }
+
                 // Apply motion config offsets/scales
                 if (this.motioncfg) {
                     for (const morphTarget in this.expressionData) {
@@ -863,6 +897,89 @@ export class GaussianSplatRenderer {
         });
         this._overridableBones = map;
         return map;
+    }
+
+    /**
+     * Camera-anchored gaze realization (look-at).
+     *
+     * Each frame, solves the eye rotation (relative to the head) required to
+     * keep gaze on the CAMERA given the head bone's ACTUAL world pose (baked
+     * clip + procedural neck delta + rig lean), then adds the widget's
+     * behavioral offset (saccades/aversions, degrees; {0,0} = camera). Writes
+     * the 8 ARKit eyeLook* channels into this.expressionData, which
+     * setExpression() applies to the morphs.
+     *
+     * Gaze-zero reference = the head-local camera direction captured on the
+     * FIRST frame (avatars are framed looking at the camera at rest).
+     */
+    _applyCameraGaze() {
+        const bones = this._getOverridableBones();
+        const head = bones && bones.head;
+        const cam = this.viewer && this.viewer.camera;
+        if (!head || !cam || !this.expressionData) return;
+
+        const offset = this.getGazeOffset();
+        if (!offset) return;
+
+        // Head-local direction to the camera, using THIS frame's bone pose.
+        head.getWorldPosition(tempVector3A);
+        head.getWorldQuaternion(tempQuaternionA);
+        tempVector3B.copy(cam.position).sub(tempVector3A).normalize();
+        tempQuaternionA.invert();
+        tempVector3B.applyQuaternion(tempQuaternionA);
+
+        if (!this._gazeRestDir) {
+            this._gazeRestDir = tempVector3B.clone();
+            console.warn('[gaze-lookat] rest direction captured: '
+                + `x=${tempVector3B.x.toFixed(3)} y=${tempVector3B.y.toFixed(3)} z=${tempVector3B.z.toFixed(3)}`);
+        }
+        const rest = this._gazeRestDir;
+
+        const RAD2DEG = 180 / Math.PI;
+        const yawNow    = Math.atan2(tempVector3B.x, tempVector3B.z);
+        const pitchNow  = Math.asin(Math.max(-1, Math.min(1, tempVector3B.y)));
+        const yawRest   = Math.atan2(rest.x, rest.z);
+        const pitchRest = Math.asin(Math.max(-1, Math.min(1, rest.y)));
+
+        // Degrees the eyes must rotate (head-relative) to hold the camera.
+        // Convention: +yaw = subject-left = viewer-right (matches the widget's
+        // saccade convention); +pitch = up.
+        const lookYawDeg   = (yawNow - yawRest) * RAD2DEG * GAZE_LOOKAT.gainYaw;
+        const lookPitchDeg = (pitchNow - pitchRest) * RAD2DEG * GAZE_LOOKAT.gainPitch;
+
+        const totalYaw   = lookYawDeg + (offset.yawDeg || 0);
+        const totalPitch = lookPitchDeg + (offset.pitchDeg || 0);
+
+        // 1 Hz numeric verification trace (warn survives minification).
+        const nowMs = performance.now();
+        if (!this._gazeLogMs || nowMs - this._gazeLogMs > 1000) {
+            this._gazeLogMs = nowMs;
+            console.warn('[gaze-lookat] '
+                + `headComp(yaw=${lookYawDeg.toFixed(2)}°,pitch=${lookPitchDeg.toFixed(2)}°) `
+                + `offset(${(offset.yawDeg || 0).toFixed(2)},${(offset.pitchDeg || 0).toFixed(2)}) `
+                + `eyes(yaw=${totalYaw.toFixed(2)}°,pitch=${totalPitch.toFixed(2)}°)`);
+        }
+
+        // Map to the 8 ARKit channels with measured per-direction scales.
+        const cal = GAZE_LOOKAT.cal;
+        const e = this.expressionData;
+        e.eyeLookOutLeft = 0; e.eyeLookInLeft = 0; e.eyeLookOutRight = 0; e.eyeLookInRight = 0;
+        e.eyeLookUpLeft = 0;  e.eyeLookUpRight = 0; e.eyeLookDownLeft = 0; e.eyeLookDownRight = 0;
+        if (totalYaw > 0) {
+            // viewer-right = subject-left: left eye abducts (Out), right adducts (In)
+            e.eyeLookOutLeft = Math.min(totalYaw / cal.out, 1);
+            e.eyeLookInRight = Math.min(totalYaw / cal.in, 1);
+        } else if (totalYaw < 0) {
+            e.eyeLookInLeft   = Math.min(-totalYaw / cal.in, 1);
+            e.eyeLookOutRight = Math.min(-totalYaw / cal.out, 1);
+        }
+        if (totalPitch > 0) {
+            const u = Math.min(totalPitch / cal.up, 1);
+            e.eyeLookUpLeft = u; e.eyeLookUpRight = u;
+        } else if (totalPitch < 0) {
+            const u = Math.min(-totalPitch / cal.down, 1);
+            e.eyeLookDownLeft = u; e.eyeLookDownRight = u;
+        }
     }
 
     /**
