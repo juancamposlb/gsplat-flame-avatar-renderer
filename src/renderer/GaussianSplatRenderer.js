@@ -13,11 +13,6 @@
 
 /* global NProgress */
 
-// DEBUG 2026-06-11 16:45: top-of-module log to PROVE this build is loaded by the
-// browser. Uses console.warn because terser strips console.log via pure_funcs in
-// rollup.config.js. Remove after we've confirmed cache invalidation works.
-console.warn('[gsplat-renderer] LOADED build=2026-06-11-neckdebug (top-of-module)');
-
 import {
     Vector3,
     Bone,
@@ -990,96 +985,11 @@ export class GaussianSplatRenderer {
      * @param {{neck?: number[], rotation?: number[]} | null | undefined} pose
      */
     _applyNeckPose(pose) {
-        // DEBUG 2026-06-11: console.warn (not log) because terser strips .log
-        // via pure_funcs in rollup.config.js minify pass.
-        if (!this._neckEntryLogged) {
-            this._neckEntryLogged = true;
-            console.warn('[_applyNeckPose] ENTER  pose=', pose, '  this._getOverridableBones exists=', typeof this._getOverridableBones);
-        }
         if (!pose) return;
         const bones = this._getOverridableBones();
-        if (!bones) {
-            if (!this._neckDebugLogged) {
-                this._neckDebugLogged = true;
-                console.warn('[_applyNeckPose] bones map is null (viewer.boneRoot missing)');
-            }
-            return;
-        }
-        if (!this._neckDebugLogged) {
-            this._neckDebugLogged = true;
-            const allBones = Object.keys(bones);
-            console.warn(`[_applyNeckPose] ${allBones.length} total bones`);
-            const candidates = allBones.filter(n =>
-                /neck|head|spine|chest|abdomen|skull/i.test(n)
-            );
-            console.warn('[_applyNeckPose] head/neck candidates:', candidates);
-            console.warn('[_applyNeckPose] pose received:', JSON.parse(JSON.stringify(pose)));
+        if (!bones) return;
 
-            // DIAGNOSTIC 2026-06-11 night: dump the parent chain for head/neckUpper/neckLower
-            // to verify the hierarchy isn't inverted, AND count splat-skinning weights
-            // attached to each bone to see if body splats are erroneously weighted to head.
-            for (const bn of ['head', 'neckUpper', 'neckLower', 'chestUpper']) {
-                if (!bones[bn]) continue;
-                const chain = [];
-                let cur = bones[bn];
-                while (cur) {
-                    chain.push(cur.name || '(unnamed)');
-                    cur = cur.parent && cur.parent.isBone ? cur.parent : null;
-                }
-                console.warn(`[hierarchy] ${bn}: parents = ${chain.join(' -> ')}`);
-            }
-
-            // Splat skinning weight distribution — single-call dump so it can't get
-            // buried in requestAnimationFrame stack lines.
-            try {
-                const skinned = this.viewer && this.viewer.skinModel;
-                const skinningReport = { ok: false };
-                if (!skinned) {
-                    skinningReport.error = 'viewer.skinModel is null';
-                } else if (!skinned.geometry) {
-                    skinningReport.error = 'skinned.geometry missing';
-                } else {
-                    const idxAttr = skinned.geometry.attributes.skinIndex;
-                    const wtAttr  = skinned.geometry.attributes.skinWeight;
-                    const skel = skinned.skeleton;
-                    skinningReport.hasIdxAttr = !!idxAttr;
-                    skinningReport.hasWtAttr = !!wtAttr;
-                    skinningReport.hasSkeleton = !!skel;
-                    skinningReport.bonesArrayLen = skel && skel.bones ? skel.bones.length : -1;
-                    skinningReport.nVerts = idxAttr ? idxAttr.count : -1;
-                    skinningReport.stride = idxAttr ? idxAttr.itemSize : -1;
-                    if (idxAttr && wtAttr && skel && skel.bones && skel.bones.length > 0) {
-                        const boneNames = skel.bones.map(b => b.name);
-                        const weightPerBone = new Float32Array(boneNames.length);
-                        const idx = idxAttr.array;
-                        const wts = wtAttr.array;
-                        const stride = idxAttr.itemSize;
-                        const nVerts = idxAttr.count;
-                        for (let v = 0; v < nVerts; v++) {
-                            for (let k = 0; k < stride; k++) {
-                                weightPerBone[idx[v * stride + k]] += wts[v * stride + k];
-                            }
-                        }
-                        const totalW = weightPerBone.reduce((a, b) => a + b, 0);
-                        skinningReport.totalWeight = totalW;
-                        skinningReport.top10 = Array.from(weightPerBone, (w, i) => ({
-                            bone: boneNames[i], pct: (w / totalW * 100).toFixed(2),
-                        })).sort((a, b) => parseFloat(b.pct) - parseFloat(a.pct)).slice(0, 10);
-                        skinningReport.ok = true;
-                    }
-                }
-                console.warn('[skinning-report]', skinningReport);
-                if (skinningReport.top10) {
-                    const lines = skinningReport.top10.map((r, i) =>
-                        `  ${String(i+1).padStart(2)}. ${String(r.pct).padStart(6)}%  ${r.bone}`).join('\n');
-                    console.warn('[skinning-top10]\n' + lines);
-                }
-            } catch (e) {
-                console.warn('[skinning] error', e && e.message);
-            }
-        }
-
-        // Pose contract (2026-06-11 evening rev 2):
+        // Pose contract:
         //   Values are Euler angles in radians, 'YXZ' order, treated as a DELTA
         //   composed on top of whatever the baked clip already set on the bone
         //   (mixer.update() runs before us). bone.quaternion *= setFromEuler(delta).

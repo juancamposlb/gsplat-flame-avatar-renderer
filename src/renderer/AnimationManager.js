@@ -406,6 +406,29 @@ export class AnimationManager {
 
         this.mixer = mixer;
 
+        // Single-clip mode: when the asset provides exactly one body clip,
+        // every conversational state shares it, so there is no clip state
+        // machine to run — the clip loops continuously and conversational
+        // motion comes from the procedural layers composed on top. State
+        // changes must not touch the action: time resets, LoopOnce clamps,
+        // and crossfades between copies of the clip at different phases all
+        // snap the body pose visibly.
+        this.singleClipMode = !!(animations && animations.length === 1);
+        if (this.singleClipMode) {
+            const action = mixer.clipAction(animations[0]);
+            action.loop = LoopRepeat;
+            action.clampWhenFinished = false;
+            AnimationManager.SetWeight(action, 1.0);
+            action.play();
+            AnimationManager.actions.push(action);
+            this.hello = new Hello([], false);
+            this.idle = new Idle([action], false);
+            this.listen = new Listen([], false);
+            this.think = new Think([], false);
+            this.speak = new Speak([], false);
+            return;
+        }
+
         // Calculate action indices based on config
         const helloIdx = animationcfg?.hello?.size || 0;
         const idleIdx = (animationcfg?.idle?.size || 0) + helloIdx;
@@ -529,6 +552,7 @@ export class AnimationManager {
      * @param {string} state - Target state (TYVoiceChatState)
      */
     update(state) {
+        if (this.singleClipMode) return;
         if (AnimationManager.IsBlending) return;
 
         AnimationManager.CurPlaying = this.curPlaying();
