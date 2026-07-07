@@ -13,11 +13,18 @@
 
 /* global NProgress */
 
+// DEBUG 2026-06-11 16:45: top-of-module log to PROVE this build is loaded by the
+// browser. Uses console.warn because terser strips console.log via pure_funcs in
+// rollup.config.js. Remove after we've confirmed cache invalidation works.
+console.warn('[gsplat-renderer] LOADED build=2026-06-11-neckdebug (top-of-module)');
+
 import {
     Vector3,
     Bone,
     Clock,
-    AnimationMixer
+    AnimationMixer,
+    Euler,
+    Quaternion
 } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import JSZip from 'jszip';
@@ -45,7 +52,7 @@ import {
     validateCallback
 } from '../utils/ValidationUtils.js';
 import { BlobUrlManager } from '../utils/BlobUrlManager.js';
-import { tempVector3A, tempVector3B, tempQuaternionA } from '../utils/ObjectPool.js';
+import { tempVector3A, tempVector3B, tempQuaternionA, tempEulerA } from '../utils/ObjectPool.js';
 
 // Create logger for this module
 const logger = getLogger('GaussianSplatRenderer');
@@ -62,14 +69,20 @@ const motionConfig = {
     scale: {}
 };
 
-// Animation configuration - defines how animation clips are distributed to states
-// The animation.glb contains clips in order: hello(2), idle(1), listen(0), speak(6), think(3)
+// Animation configuration — locked decision (2026-06-11):
+// ALL states play the single looping idle clip. No speak/listen/think clips.
+// Procedural neck (getNeckPose callback) is solely responsible for adding
+// head/neck motion on top of the idle body posture. The clip provides the
+// constant body baseline, the procedural adds the conversational head dance.
+// This is cleaner than mixing baked clips with procedural overlays — there is
+// no animation state machine to fight, and transitions between conversational
+// states are entirely owned by the procedural ramp.
 const animationConfig = {
-    hello: { size: 0, isGroup: false }, // No 'hello' animations
-    speak: { size: 3, isGroup: true },   // First 3 animations are for speaking
-    think: { size: 0, isGroup: false },  // 'think' will share 'speak' animations
-    listen: { size: 0, isGroup: false}, // 'listen' will share 'idle' animations
-    idle: { size: 1, isGroup: false },   // The next animation is for idle
+    hello: { size: 0, isGroup: false }, // No 'hello'
+    speak: { size: 0, isGroup: false }, // shares idle — procedural neck handles speech head motion
+    think: { size: 0, isGroup: false }, // shares idle
+    listen: { size: 0, isGroup: false}, // shares idle
+    idle: { size: 1, isGroup: false },  // single looping idle clip — always playing
     other: []
 };
 
@@ -860,28 +873,128 @@ export class GaussianSplatRenderer {
      * @param {{neck?: number[], rotation?: number[]} | null | undefined} pose
      */
     _applyNeckPose(pose) {
+        // DEBUG 2026-06-11: console.warn (not log) because terser strips .log
+        // via pure_funcs in rollup.config.js minify pass.
+        if (!this._neckEntryLogged) {
+            this._neckEntryLogged = true;
+            console.warn('[_applyNeckPose] ENTER  pose=', pose, '  this._getOverridableBones exists=', typeof this._getOverridableBones);
+        }
         if (!pose) return;
         const bones = this._getOverridableBones();
-        if (!bones) return;
+        if (!bones) {
+            if (!this._neckDebugLogged) {
+                this._neckDebugLogged = true;
+                console.warn('[_applyNeckPose] bones map is null (viewer.boneRoot missing)');
+            }
+            return;
+        }
+        if (!this._neckDebugLogged) {
+            this._neckDebugLogged = true;
+            const allBones = Object.keys(bones);
+            console.warn(`[_applyNeckPose] ${allBones.length} total bones`);
+            const candidates = allBones.filter(n =>
+                /neck|head|spine|chest|abdomen|skull/i.test(n)
+            );
+            console.warn('[_applyNeckPose] head/neck candidates:', candidates);
+            console.warn('[_applyNeckPose] pose received:', JSON.parse(JSON.stringify(pose)));
 
-        const setAxisAngle = (boneName, axisAngle) => {
-            if (!Array.isArray(axisAngle) || axisAngle.length < 3) return;
+            // DIAGNOSTIC 2026-06-11 night: dump the parent chain for head/neckUpper/neckLower
+            // to verify the hierarchy isn't inverted, AND count splat-skinning weights
+            // attached to each bone to see if body splats are erroneously weighted to head.
+            for (const bn of ['head', 'neckUpper', 'neckLower', 'chestUpper']) {
+                if (!bones[bn]) continue;
+                const chain = [];
+                let cur = bones[bn];
+                while (cur) {
+                    chain.push(cur.name || '(unnamed)');
+                    cur = cur.parent && cur.parent.isBone ? cur.parent : null;
+                }
+                console.warn(`[hierarchy] ${bn}: parents = ${chain.join(' -> ')}`);
+            }
+
+            // Splat skinning weight distribution — single-call dump so it can't get
+            // buried in requestAnimationFrame stack lines.
+            try {
+                const skinned = this.viewer && this.viewer.skinModel;
+                const skinningReport = { ok: false };
+                if (!skinned) {
+                    skinningReport.error = 'viewer.skinModel is null';
+                } else if (!skinned.geometry) {
+                    skinningReport.error = 'skinned.geometry missing';
+                } else {
+                    const idxAttr = skinned.geometry.attributes.skinIndex;
+                    const wtAttr  = skinned.geometry.attributes.skinWeight;
+                    const skel = skinned.skeleton;
+                    skinningReport.hasIdxAttr = !!idxAttr;
+                    skinningReport.hasWtAttr = !!wtAttr;
+                    skinningReport.hasSkeleton = !!skel;
+                    skinningReport.bonesArrayLen = skel && skel.bones ? skel.bones.length : -1;
+                    skinningReport.nVerts = idxAttr ? idxAttr.count : -1;
+                    skinningReport.stride = idxAttr ? idxAttr.itemSize : -1;
+                    if (idxAttr && wtAttr && skel && skel.bones && skel.bones.length > 0) {
+                        const boneNames = skel.bones.map(b => b.name);
+                        const weightPerBone = new Float32Array(boneNames.length);
+                        const idx = idxAttr.array;
+                        const wts = wtAttr.array;
+                        const stride = idxAttr.itemSize;
+                        const nVerts = idxAttr.count;
+                        for (let v = 0; v < nVerts; v++) {
+                            for (let k = 0; k < stride; k++) {
+                                weightPerBone[idx[v * stride + k]] += wts[v * stride + k];
+                            }
+                        }
+                        const totalW = weightPerBone.reduce((a, b) => a + b, 0);
+                        skinningReport.totalWeight = totalW;
+                        skinningReport.top10 = Array.from(weightPerBone, (w, i) => ({
+                            bone: boneNames[i], pct: (w / totalW * 100).toFixed(2),
+                        })).sort((a, b) => parseFloat(b.pct) - parseFloat(a.pct)).slice(0, 10);
+                        skinningReport.ok = true;
+                    }
+                }
+                console.warn('[skinning-report]', skinningReport);
+                if (skinningReport.top10) {
+                    const lines = skinningReport.top10.map((r, i) =>
+                        `  ${String(i+1).padStart(2)}. ${String(r.pct).padStart(6)}%  ${r.bone}`).join('\n');
+                    console.warn('[skinning-top10]\n' + lines);
+                }
+            } catch (e) {
+                console.warn('[skinning] error', e && e.message);
+            }
+        }
+
+        // Pose contract (2026-06-11 evening rev 2):
+        //   Values are Euler angles in radians, 'YXZ' order, treated as a DELTA
+        //   composed on top of whatever the baked clip already set on the bone
+        //   (mixer.update() runs before us). bone.quaternion *= setFromEuler(delta).
+        //
+        //   Identity delta [0,0,0] = no-op = baked clip wins. This means the
+        //   widget can ramp procedural amplitude 0→1 without snapping the bone
+        //   to bind pose at amplitude 0 — instead, amplitude 0 just leaves the
+        //   bone at whatever the clip wants for that frame.
+        //
+        //   Postmultiply (clip * delta) rotates the bone in its LOCAL frame
+        //   after the clip's parent inheritance, which is the natural reading
+        //   of "head turns 5° to the right of where the speak clip aimed it".
+        const applyDeltaEulerYXZ = (boneName, eulerXYZ) => {
+            if (!Array.isArray(eulerXYZ) || eulerXYZ.length < 3) return;
             const bone = bones[boneName];
             if (!bone) return;
-            tempVector3B.set(axisAngle[0], axisAngle[1], axisAngle[2]);
-            const angle = tempVector3B.length();
-            if (angle > 1e-7) {
-                tempVector3B.normalize();
-                tempQuaternionA.setFromAxisAngle(tempVector3B, angle);
-            } else {
-                tempQuaternionA.set(0, 0, 0, 1);
-            }
-            bone.quaternion.copy(tempQuaternionA);
+            tempEulerA.set(eulerXYZ[0], eulerXYZ[1], eulerXYZ[2], 'YXZ');
+            tempQuaternionA.setFromEuler(tempEulerA);
+            bone.quaternion.multiply(tempQuaternionA);
         };
 
-        setAxisAngle('neck', pose.neck);
-        // FLAME root bone in skin.glb is named 'hip' per the OAC contract.
-        setAxisAngle('hip', pose.rotation);
+        // Rig-agnostic application: each pose key IS the bone name (the widget
+        // knows the avatar's rig and provides the right names — DAZ chains like
+        // `head`, `neckUpper`, `neckLower`; FLAME's single `neck`; etc.).
+        // Legacy alias preserved for older callers:
+        //   pose.rotation -> bone 'hip'  (was the global head/body root)
+        // Unknown keys that don't match a bone name are silently skipped.
+        for (const key in pose) {
+            if (!Object.hasOwn(pose, key)) continue;
+            const boneName = (key === 'rotation') ? 'hip' : key;
+            applyDeltaEulerYXZ(boneName, pose[key]);
+        }
     }
 
     /**
