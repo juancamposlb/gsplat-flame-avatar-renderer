@@ -446,16 +446,21 @@ export class AnimationManager {
                     helloActions.push(action);
                 } else if (i < idleIdx) {
                     idleActions.push(action);
-                    // Duplicate for states that share idle
-                    if (listenIdx === idleIdx) {
-                        listenActions.push(mixer.clipAction(clip.clone()));
-                    }
-                    if (speakIdx === listenIdx) {
-                        speakActions.push(mixer.clipAction(clip.clone()));
-                    }
-                    if (thinkIdx === speakIdx) {
-                        thinkActions.push(mixer.clipAction(clip.clone()));
-                    }
+                    // Duplicate for states that share idle. Clones must be
+                    // registered in the global action list like any other
+                    // action — UnPauseAllActions/PauseAllActions iterate it,
+                    // and an unregistered clone that finishes a LoopOnce
+                    // clamp stays paused forever (play() does not unpause),
+                    // freezing the body on re-entry to the state.
+                    const cloneForState = (stateActions) => {
+                        const cloneAction = mixer.clipAction(clip.clone());
+                        stateActions.push(cloneAction);
+                        AnimationManager.actions.push(cloneAction);
+                        AnimationManager.SetWeight(cloneAction, 0);
+                    };
+                    if (listenIdx === idleIdx) cloneForState(listenActions);
+                    if (speakIdx === listenIdx) cloneForState(speakActions);
+                    if (thinkIdx === speakIdx) cloneForState(thinkActions);
                 } else if (i < listenIdx) {
                     listenActions.push(action);
                 } else if (i < speakIdx) {
