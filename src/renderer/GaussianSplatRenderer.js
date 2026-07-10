@@ -40,7 +40,8 @@ import {
     NetworkError,
     AssetLoadError,
     InitializationError,
-    ResourceDisposedError
+    ResourceDisposedError,
+    ParseError
 } from '../errors/index.js';
 import {
     validateUrl,
