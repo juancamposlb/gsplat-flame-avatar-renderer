@@ -19,7 +19,9 @@ import {
     Clock,
     AnimationMixer,
     Euler,
-    Quaternion
+    Quaternion,
+    LoopRepeat,
+    LoopOnce
 } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import JSZip from 'jszip';
@@ -64,20 +66,19 @@ const motionConfig = {
     scale: {}
 };
 
-// Animation configuration — locked decision (2026-06-11):
-// ALL states play the single looping idle clip. No speak/listen/think clips.
-// Procedural neck (getNeckPose callback) is solely responsible for adding
-// head/neck motion on top of the idle body posture. The clip provides the
-// constant body baseline, the procedural adds the conversational head dance.
-// This is cleaner than mixing baked clips with procedural overlays — there is
-// no animation state machine to fight, and transitions between conversational
-// states are entirely owned by the procedural ramp.
+// Animation configuration. Clips are assigned to states by their order in
+// animation.glb, sliced cumulatively: hello, then idle, then listen, then
+// speak, then think. The expected asset layout is:
+//   index 0     idle        (looping baseline)
+//   index 1..6  speak_1..4, speak, speak_end (random pool while Responding)
+// States with size 0 share a clone of the idle clip, matching the upstream
+// gaussian-splat-renderer-for-lam behavior.
 const animationConfig = {
-    hello: { size: 0, isGroup: false }, // No 'hello'
-    speak: { size: 0, isGroup: false }, // shares idle — procedural neck handles speech head motion
-    think: { size: 0, isGroup: false }, // shares idle
-    listen: { size: 0, isGroup: false}, // shares idle
-    idle: { size: 1, isGroup: false },  // single looping idle clip — always playing
+    hello: { size: 0, isGroup: false },
+    speak: { size: 6, isGroup: false },
+    think: { size: 0, isGroup: false },
+    listen: { size: 0, isGroup: false},
+    idle: { size: 1, isGroup: false },
     other: []
 };
 
@@ -789,7 +790,11 @@ export class GaussianSplatRenderer {
                     });
                     this._lastLoggedState = this.chatState;
                 }
-                this.animManager?.update(this.chatState);
+                // Clip preview suspends the state machine so a previewed clip
+                // is not fought by the per-state animation logic.
+                if (!this._clipPreviewActive) {
+                    this.animManager?.update(this.chatState);
+                }
             }
 
             // Update expression data
@@ -978,6 +983,46 @@ export class GaussianSplatRenderer {
     }
 
     /**
+     * List the names and durations of all animation clips in the loaded asset.
+     * @returns {{name: string, duration: number}[]}
+     */
+    listClips() {
+        return (this.clips ?? []).map(c => ({ name: c.name, duration: c.duration }));
+    }
+
+    /**
+     * Preview a single clip by name. Suspends the per-state animation logic
+     * and plays the clip alone, so it can be judged in isolation.
+     * @param {string} name  clip name from listClips()
+     * @param {boolean} [loop=true]  loop the clip; false = play once and hold
+     * @returns {number|null} clip duration in seconds, or null if not found
+     */
+    playClip(name, loop = true) {
+        const clip = (this.clips ?? []).find(c => c.name === name);
+        if (!clip || !this.mixer) return null;
+        this._clipPreviewActive = true;
+        this.mixer.stopAllAction();
+        const action = this.mixer.clipAction(clip);
+        action.reset();
+        action.loop = loop ? LoopRepeat : LoopOnce;
+        action.clampWhenFinished = true;
+        action.setEffectiveTimeScale(1);
+        action.setEffectiveWeight(1);
+        action.play();
+        return clip.duration;
+    }
+
+    /**
+     * End clip preview and hand control back to the state machine.
+     */
+    stopClipPreview() {
+        if (!this._clipPreviewActive) return;
+        this._clipPreviewActive = false;
+        if (this.mixer) this.mixer.stopAllAction();
+        this.animManager?.resetAllActions(true);
+    }
+
+    /**
      * Apply axis-angle bone overrides from the getNeckPose callback.
      * Uses module-level singleton Vector3/Quaternion to stay allocation-free
      * (this runs every frame at 30 Hz).
@@ -1111,6 +1156,8 @@ export class GaussianSplatRenderer {
         this.mixer = new AnimationMixer(skinModel);
         this.animManager = new AnimationManager(this.mixer, aniclip, animationConfig);
         this.motioncfg = motionConfig;
+        // Keep the raw clip list for the clip-preview API.
+        this.clips = Array.isArray(aniclip) ? aniclip : [];
 
         // Set totalFrames from animation clips or default to 1
         if (Array.isArray(aniclip) && aniclip.length > 0 && aniclip[0].duration) {
