@@ -1291,6 +1291,60 @@ export class SplatMesh extends Mesh {
         this.material.uniformsNeedUpdate = true;
     }
 
+    /**
+     * Build a skinIndex + skinWeight data texture indexed by LOGICAL splatIndex.
+     * Required because the depth-sort overwrites the per-instance splatIndex
+     * attribute every frame, but the original per-instance skinIndex/skinWeight
+     * InstancedBufferAttributes are static, so reading them per-slot reads the
+     * skin data of the wrong logical splat. Texture lookup via splatIndex stays
+     * aligned.
+     *
+     * @param {THREE.SkinnedMesh} skinModel - the SkinnedMesh with per-vertex
+     *   skinIndex (4 ints) and skinWeight (4 floats) attributes.
+     */
+    buildSkinningTextures(skinModel) {
+        if (!skinModel || !skinModel.geometry) return;
+        const idxSrc = skinModel.geometry.attributes.skinIndex;
+        const wSrc = skinModel.geometry.attributes.skinWeight;
+        if (!idxSrc || !wSrc) return;
+
+        const N = idxSrc.count;
+        const texSize = new Vector2(512, 512);
+        const cap = texSize.x * texSize.y;
+        if (N > cap) {
+            console.warn(`buildSkinningTextures: ${N} splats > 512x512 texture capacity ${cap}; truncating`);
+        }
+
+        // skinIndex texture: RGBA32UI (4 uint32 per splat — only need 0..261 but uint32 is simplest)
+        const idxData = new Uint32Array(cap * 4);
+        for (let i = 0; i < N; i++) {
+            idxData[i*4 + 0] = idxSrc.array[i*4 + 0];
+            idxData[i*4 + 1] = idxSrc.array[i*4 + 1];
+            idxData[i*4 + 2] = idxSrc.array[i*4 + 2];
+            idxData[i*4 + 3] = idxSrc.array[i*4 + 3];
+        }
+        const idxTex = new DataTexture(idxData, texSize.x, texSize.y, RGBAIntegerFormat, UnsignedIntType);
+        idxTex.internalFormat = 'RGBA32UI';
+        idxTex.needsUpdate = true;
+
+        // skinWeight texture: stored as uintEncodedFloat (same pattern as boneWeightTexture)
+        const wData = new Uint32Array(cap * 4);
+        for (let i = 0; i < N; i++) {
+            wData[i*4 + 0] = uintEncodedFloat(wSrc.array[i*4 + 0]);
+            wData[i*4 + 1] = uintEncodedFloat(wSrc.array[i*4 + 1]);
+            wData[i*4 + 2] = uintEncodedFloat(wSrc.array[i*4 + 2]);
+            wData[i*4 + 3] = uintEncodedFloat(wSrc.array[i*4 + 3]);
+        }
+        const wTex = new DataTexture(wData, texSize.x, texSize.y, RGBAIntegerFormat, UnsignedIntType);
+        wTex.internalFormat = 'RGBA32UI';
+        wTex.needsUpdate = true;
+
+        this.material.uniforms.skinIndexTexture.value = idxTex;
+        this.material.uniforms.skinWeightTexture.value = wTex;
+        this.material.uniforms.skinDataTextureSize.value.copy(texSize);
+        this.material.uniformsNeedUpdate = true;
+    }
+
     buildBoneWeightTexture(flameModel) {
         // Guard: bonesWeight is required for FLAME bone weight texture building
         if (!this.bonesWeight) {

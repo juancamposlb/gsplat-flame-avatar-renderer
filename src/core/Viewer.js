@@ -2738,6 +2738,12 @@ export class Viewer {
       newSkinWeight.setUsage(DynamicDrawUsage);
       geometry.setAttribute('skinIndex', newSkinIndex);
       geometry.setAttribute('skinWeight', newSkinWeight);
+
+      // Also build splatIndex-keyed skin data textures so per-vertex skinning
+      // stays correct under the depth-sort permutation of splatIndex.
+      if (typeof this.splatMesh.buildSkinningTextures === 'function') {
+        this.splatMesh.buildSkinningTextures(this.skinModel);
+      }
     }
 
     this.splatMesh.morphedMesh = morphedMesh;

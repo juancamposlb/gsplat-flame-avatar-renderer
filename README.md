@@ -80,6 +80,8 @@ Creates a new renderer instance with proper resource isolation.
 | `backgroundColor` | `string` | Hex color string (e.g., '0x000000') |
 | `getChatState` | `() => string` | Callback returning current animation state |
 | `getExpressionData` | `() => object` | Callback returning blendshape weights |
+| `getGazeOffset` | `() => {yawDeg, pitchDeg}` | Optional. Behavioral gaze offset from the camera axis in degrees; when provided, the renderer solves the eye-look blendshapes each frame so the eyes stay anchored to the camera regardless of head pose ({0,0} = mutual gaze) |
+| `getNeckPose` | `() => object \| null` | Optional. Per-frame bone rotation deltas (Euler YXZ, radians) composed on top of the animation clips; keys are bone names. Return `null` for no override |
 | `loadProgress` | `(progress: number) => void` | Loading progress callback |
 | `downloadProgress` | `(progress: number) => void` | Download progress callback |
 
@@ -93,6 +95,16 @@ The renderer supports the following states via `getChatState`:
 | `'Listening'` | Listening state animation |
 | `'Thinking'` | Processing/thinking animation |
 | `'Responding'` | Speaking/responding animation |
+
+### Clip Preview
+
+For auditioning individual animation clips (e.g. in an asset-review tool), the renderer exposes a preview API that bypasses the state machine:
+
+| Method | Description |
+|--------|-------------|
+| `listClips()` | Returns `{ name, duration }` for every clip in the loaded `animation.glb` |
+| `playClip(name, loop?)` | Plays a single clip (optionally looped) with the state machine suspended; returns the clip duration in seconds, or `null` if not found |
+| `stopClipPreview()` | Stops the preview and resumes the state machine |
 
 ### ARKit Blendshapes (52)
 
@@ -125,6 +137,17 @@ avatar.zip
 │   ├── vertex_order.json      # Vertex ordering data (required)
 │   └── iris_occlusion.json    # Iris occlusion ranges (optional)
 ```
+
+### Animation Clip Order
+
+Clips in `animation.glb` are assigned to animation states by their **order in the file** — there is no name-based lookup. The expected layout is:
+
+| Index | Clip | Used by state |
+|-------|------|---------------|
+| 0 | idle loop | `Idle` (also shared by `Listening` and `Thinking`) |
+| 1–6 | speak variants | `Responding` — picked at random and cross-faded (0.5 s) while the state is active |
+
+Assets with fewer speak clips degrade gracefully (the `Responding` pool simply shrinks). An `animation.glb` with a single clip plays that clip continuously across all states.
 
 ### Optional: Iris Occlusion
 
