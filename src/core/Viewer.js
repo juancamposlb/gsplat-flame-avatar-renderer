@@ -529,11 +529,12 @@ export class Viewer {
       this.renderer = new WebGLRenderer({
         antialias: false,
         precision: 'highp',
-        canvas: this.canvas
+        canvas: this.canvas,
+        alpha: true
       });
       this.renderer.setPixelRatio(this.devicePixelRatio);
       this.renderer.autoClear = true;
-      this.renderer.setClearColor(this.backgroundColor, 1.0); // set background color according to the config
+      this.renderer.setClearColor(this.backgroundColor, 0.0); // set background color according to the config
 
       this.renderer.setSize(renderDimensions.x, renderDimensions.y);
 
