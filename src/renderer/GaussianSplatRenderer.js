@@ -17,7 +17,11 @@ import {
     Vector3,
     Bone,
     Clock,
-    AnimationMixer
+    AnimationMixer,
+    Euler,
+    Quaternion,
+    LoopRepeat,
+    LoopOnce
 } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import JSZip from 'jszip';
@@ -36,7 +40,8 @@ import {
     NetworkError,
     AssetLoadError,
     InitializationError,
-    ResourceDisposedError
+    ResourceDisposedError,
+    ParseError
 } from '../errors/index.js';
 import {
     validateUrl,
@@ -45,7 +50,7 @@ import {
     validateCallback
 } from '../utils/ValidationUtils.js';
 import { BlobUrlManager } from '../utils/BlobUrlManager.js';
-import { tempVector3A } from '../utils/ObjectPool.js';
+import { tempVector3A, tempVector3B, tempQuaternionA, tempEulerA } from '../utils/ObjectPool.js';
 
 // Create logger for this module
 const logger = getLogger('GaussianSplatRenderer');
@@ -62,15 +67,33 @@ const motionConfig = {
     scale: {}
 };
 
-// Animation configuration - defines how animation clips are distributed to states
-// The animation.glb contains clips in order: hello(2), idle(1), listen(0), speak(6), think(3)
+// Animation configuration. Clips are assigned to states by their order in
+// animation.glb, sliced cumulatively: hello, then idle, then listen, then
+// speak, then think. The expected asset layout is:
+//   index 0     idle        (looping baseline)
+//   index 1..6  speak_1..4, speak, speak_end (random pool while Responding)
+// States with size 0 share a clone of the idle clip, matching the upstream
+// gaussian-splat-renderer-for-lam behavior.
 const animationConfig = {
-    hello: { size: 0, isGroup: false }, // No 'hello' animations
-    speak: { size: 3, isGroup: true },   // First 3 animations are for speaking
-    think: { size: 0, isGroup: false },  // 'think' will share 'speak' animations
-    listen: { size: 0, isGroup: false}, // 'listen' will share 'idle' animations
-    idle: { size: 1, isGroup: false },   // The next animation is for idle
+    hello: { size: 0, isGroup: false },
+    speak: { size: 6, isGroup: false },
+    think: { size: 0, isGroup: false },
+    listen: { size: 0, isGroup: false},
+    idle: { size: 1, isGroup: false },
     other: []
+};
+
+// Camera-anchored gaze.
+// cal: eye-morph rotation scales in degrees per unit of morph influence,
+// measured from the mesh (morph displacement ÷ eyeball radius). The rig's
+// morphs are asymmetric (out ≠ in), so the abducting and adducting eye need
+// different scales to rotate the same physical angle.
+// gains: empirical sign/strength of the head-compensation term — flip to -1
+// if a live test shows the eyes following the head instead of holding camera.
+const GAZE_LOOKAT = {
+    cal: { out: 21.4, in: 9.6, up: 14.2, down: 11.9 },
+    gainYaw: 1.0,
+    gainPitch: 1.0,
 };
 
 /**
@@ -87,6 +110,23 @@ export class GaussianSplatRenderer {
      * @param {Function} [options.loadProgress] - Load progress callback (0-1)
      * @param {Function} [options.getChatState] - Chat state provider function
      * @param {Function} [options.getExpressionData] - Expression data provider function
+     * @param {Function} [options.getNeckPose] - Per-frame neck/head pose override.
+     *   Called every frame after mixer.update(). Return value shape:
+     *     { neck?: [x,y,z], rotation?: [x,y,z] }
+     *   Each is an axis-angle vector (magnitude = angle in radians) applied to the
+     *   matching FLAME bone (neck = bones[1], rotation = root 'hip' = bones[0]).
+     *   Returning null/undefined leaves the baked animation untouched.
+     *   Override is SET (replaces clip rotation for that bone). Mix with the clip
+     *   on the caller side if needed.
+     * @param {Function} [options.getGazeOffset] - Camera-anchored gaze (look-at).
+     *   Called every frame after the neck pose is applied. When provided, the
+     *   renderer OWNS the 8 eyeLook* morphs: it solves the eye rotation needed
+     *   to keep gaze on the CAMERA given the head bone's actual world pose
+     *   (baked clip + procedural delta), then adds the returned behavioral
+     *   offset { yawDeg, pitchDeg } (0,0 = mutual gaze at camera; saccades /
+     *   aversions are expressed as offsets). Return null to skip for a frame
+     *   (widget-supplied eyeLook* values pass through). Omit the option
+     *   entirely for legacy behavior (no look-at, eyeLook* untouched).
      * @param {string} [options.backgroundColor] - Background color (hex string)
      * @returns {Promise<GaussianSplatRenderer>} Renderer instance
      * @throws {ValidationError} If parameters are invalid
@@ -113,6 +153,12 @@ export class GaussianSplatRenderer {
             }
             if (options.getExpressionData) {
                 validateCallback(options.getExpressionData, 'options.getExpressionData', false);
+            }
+            if (options.getNeckPose) {
+                validateCallback(options.getNeckPose, 'options.getNeckPose', false);
+            }
+            if (options.getGazeOffset) {
+                validateCallback(options.getGazeOffset, 'options.getGazeOffset', false);
             }
             if (options.backgroundColor) {
                 validateHexColor(options.backgroundColor, 'options.backgroundColor');
@@ -290,12 +336,14 @@ export class GaussianSplatRenderer {
             // Store callbacks
             renderer.getChatState = options?.getChatState;
             renderer.getExpressionData = options?.getExpressionData;
+            renderer.getNeckPose = options?.getNeckPose;
+            renderer.getGazeOffset = options?.getGazeOffset;
 
             // Load iris occlusion configuration BEFORE creating viewer (optional)
             logger.debug('Checking for iris_occlusion.json');
             let irisOcclusionConfig = null;
             try {
-                
+
                 if (options.irisOcclusionConfig) {
                     logger.debug('Iris occlusion configuration provided via options, using that instead of loading from ZIP');
                     irisOcclusionConfig = options.irisOcclusionConfig; // Override with options if provided
@@ -502,6 +550,11 @@ export class GaussianSplatRenderer {
         this.motioncfg = null;
         this.getChatState = null;
         this.getExpressionData = null;
+        this.getNeckPose = null;
+
+        // Cache for skeleton bones used by procedural pose override.
+        // Populated lazily on first override call after loadModel().
+        this._overridableBones = null;
 
         logger.debug('GaussianSplatRenderer instance created');
     }
@@ -575,6 +628,8 @@ export class GaussianSplatRenderer {
         this.motioncfg = null;
         this.getChatState = null;
         this.getExpressionData = null;
+        this.getNeckPose = null;
+        this._overridableBones = null;
         this.zipUrls = null;
 
         // Mark as disposed
@@ -598,6 +653,9 @@ export class GaussianSplatRenderer {
      */
     disposeModel() {
         logger.debug('Disposing model resources');
+
+        // Invalidate procedural pose bone cache (bones belong to the about-to-be-freed viewer)
+        this._overridableBones = null;
 
         // Dispose animation mixer
         if (this.mixer) {
@@ -739,7 +797,11 @@ export class GaussianSplatRenderer {
                     });
                     this._lastLoggedState = this.chatState;
                 }
-                this.animManager?.update(this.chatState);
+                // Clip preview suspends the state machine so a previewed clip
+                // is not fought by the per-state animation logic.
+                if (!this._clipPreviewActive) {
+                    this.animManager?.update(this.chatState);
+                }
             }
 
             // Update expression data
@@ -761,6 +823,21 @@ export class GaussianSplatRenderer {
             } else {
                 const mixerUpdateDelta = this.clock.getDelta();
                 this.mixer.update(mixerUpdateDelta);
+
+                // Procedural neck/head pose override.
+                // Runs AFTER mixer.update() so caller wins vs baked clip; runs BEFORE
+                // viewer.update() so the splat skinning sees the overridden bones.
+                if (this.getNeckPose) {
+                    this._applyNeckPose(this.getNeckPose());
+                }
+
+                // Camera-anchored gaze (look-at). Runs AFTER the neck pose so it
+                // sees the FINAL head orientation for this frame (clip + delta),
+                // and BEFORE setExpression() so its eyeLook values are what the
+                // morphs receive.
+                if (this.getGazeOffset) {
+                    this._applyCameraGaze();
+                }
 
                 // Apply motion config offsets/scales
                 if (this.motioncfg) {
@@ -808,6 +885,195 @@ export class GaussianSplatRenderer {
         if (typeof value !== 'string') return false;
         const hexColorRegex = /^(#|0x)[0-9A-Fa-f]{6}$/i;
         return hexColorRegex.test(value);
+    }
+
+    /**
+     * Resolve and cache the FLAME bones eligible for procedural pose override.
+     * Walks the skeleton starting at `viewer.boneRoot` (the 'hip' bone) once and
+     * maps bone names to Bone instances. Returns null until the model is loaded.
+     * @private
+     * @returns {Object<string, import('three').Bone>|null}
+     */
+    _getOverridableBones() {
+        if (this._overridableBones) return this._overridableBones;
+        const root = this.viewer?.boneRoot;
+        if (!root) return null;
+        const map = {};
+        root.traverse((node) => {
+            if (node.isBone) map[node.name] = node;
+        });
+        this._overridableBones = map;
+        return map;
+    }
+
+    /**
+     * Camera-anchored gaze realization (look-at).
+     *
+     * Each frame, solves the eye rotation (relative to the head) required to
+     * keep gaze on the CAMERA given the head bone's ACTUAL world pose (baked
+     * clip + procedural neck delta + rig lean), then adds the widget's
+     * behavioral offset (saccades/aversions, degrees; {0,0} = camera). Writes
+     * the 8 ARKit eyeLook* channels into this.expressionData, which
+     * setExpression() applies to the morphs.
+     *
+     * Gaze-zero reference = the head-local camera direction captured on the
+     * FIRST frame (avatars are framed looking at the camera at rest).
+     */
+    _applyCameraGaze() {
+        const bones = this._getOverridableBones();
+        const head = bones && bones.head;
+        const cam = this.viewer && this.viewer.camera;
+        if (!head || !cam || !this.expressionData) return;
+
+        const offset = this.getGazeOffset();
+        if (!offset) return;
+
+        // Head-local direction to the camera, using THIS frame's bone pose.
+        head.getWorldPosition(tempVector3A);
+        head.getWorldQuaternion(tempQuaternionA);
+        tempVector3B.copy(cam.position).sub(tempVector3A).normalize();
+        tempQuaternionA.invert();
+        tempVector3B.applyQuaternion(tempQuaternionA);
+
+        if (!this._gazeRestDir) {
+            this._gazeRestDir = tempVector3B.clone();
+            console.warn('[gaze-lookat] rest direction captured: '
+                + `x=${tempVector3B.x.toFixed(3)} y=${tempVector3B.y.toFixed(3)} z=${tempVector3B.z.toFixed(3)}`);
+        }
+        const rest = this._gazeRestDir;
+
+        const RAD2DEG = 180 / Math.PI;
+        const yawNow    = Math.atan2(tempVector3B.x, tempVector3B.z);
+        const pitchNow  = Math.asin(Math.max(-1, Math.min(1, tempVector3B.y)));
+        const yawRest   = Math.atan2(rest.x, rest.z);
+        const pitchRest = Math.asin(Math.max(-1, Math.min(1, rest.y)));
+
+        // Degrees the eyes must rotate (head-relative) to hold the camera.
+        // Convention: +yaw = subject-left = viewer-right (matches the widget's
+        // saccade convention); +pitch = up.
+        const lookYawDeg   = (yawNow - yawRest) * RAD2DEG * GAZE_LOOKAT.gainYaw;
+        const lookPitchDeg = (pitchNow - pitchRest) * RAD2DEG * GAZE_LOOKAT.gainPitch;
+
+        const totalYaw   = lookYawDeg + (offset.yawDeg || 0);
+        const totalPitch = lookPitchDeg + (offset.pitchDeg || 0);
+
+        // 1 Hz numeric verification trace (warn survives minification).
+        const nowMs = performance.now();
+        if (!this._gazeLogMs || nowMs - this._gazeLogMs > 1000) {
+            this._gazeLogMs = nowMs;
+            console.warn('[gaze-lookat] '
+                + `headComp(yaw=${lookYawDeg.toFixed(2)}°,pitch=${lookPitchDeg.toFixed(2)}°) `
+                + `offset(${(offset.yawDeg || 0).toFixed(2)},${(offset.pitchDeg || 0).toFixed(2)}) `
+                + `eyes(yaw=${totalYaw.toFixed(2)}°,pitch=${totalPitch.toFixed(2)}°)`);
+        }
+
+        // Map to the 8 ARKit channels with measured per-direction scales.
+        const cal = GAZE_LOOKAT.cal;
+        const e = this.expressionData;
+        e.eyeLookOutLeft = 0; e.eyeLookInLeft = 0; e.eyeLookOutRight = 0; e.eyeLookInRight = 0;
+        e.eyeLookUpLeft = 0;  e.eyeLookUpRight = 0; e.eyeLookDownLeft = 0; e.eyeLookDownRight = 0;
+        if (totalYaw > 0) {
+            // viewer-right = subject-left: left eye abducts (Out), right adducts (In)
+            e.eyeLookOutLeft = Math.min(totalYaw / cal.out, 1);
+            e.eyeLookInRight = Math.min(totalYaw / cal.in, 1);
+        } else if (totalYaw < 0) {
+            e.eyeLookInLeft   = Math.min(-totalYaw / cal.in, 1);
+            e.eyeLookOutRight = Math.min(-totalYaw / cal.out, 1);
+        }
+        if (totalPitch > 0) {
+            const u = Math.min(totalPitch / cal.up, 1);
+            e.eyeLookUpLeft = u; e.eyeLookUpRight = u;
+        } else if (totalPitch < 0) {
+            const u = Math.min(-totalPitch / cal.down, 1);
+            e.eyeLookDownLeft = u; e.eyeLookDownRight = u;
+        }
+    }
+
+    /**
+     * List the names and durations of all animation clips in the loaded asset.
+     * @returns {{name: string, duration: number}[]}
+     */
+    listClips() {
+        return (this.clips ?? []).map(c => ({ name: c.name, duration: c.duration }));
+    }
+
+    /**
+     * Preview a single clip by name. Suspends the per-state animation logic
+     * and plays the clip alone, so it can be judged in isolation.
+     * @param {string} name  clip name from listClips()
+     * @param {boolean} [loop=true]  loop the clip; false = play once and hold
+     * @returns {number|null} clip duration in seconds, or null if not found
+     */
+    playClip(name, loop = true) {
+        const clip = (this.clips ?? []).find(c => c.name === name);
+        if (!clip || !this.mixer) return null;
+        this._clipPreviewActive = true;
+        this.mixer.stopAllAction();
+        const action = this.mixer.clipAction(clip);
+        action.reset();
+        action.loop = loop ? LoopRepeat : LoopOnce;
+        action.clampWhenFinished = true;
+        action.setEffectiveTimeScale(1);
+        action.setEffectiveWeight(1);
+        action.play();
+        return clip.duration;
+    }
+
+    /**
+     * End clip preview and hand control back to the state machine.
+     */
+    stopClipPreview() {
+        if (!this._clipPreviewActive) return;
+        this._clipPreviewActive = false;
+        if (this.mixer) this.mixer.stopAllAction();
+        this.animManager?.resetAllActions(true);
+    }
+
+    /**
+     * Apply axis-angle bone overrides from the getNeckPose callback.
+     * Uses module-level singleton Vector3/Quaternion to stay allocation-free
+     * (this runs every frame at 30 Hz).
+     * @private
+     * @param {{neck?: number[], rotation?: number[]} | null | undefined} pose
+     */
+    _applyNeckPose(pose) {
+        if (!pose) return;
+        const bones = this._getOverridableBones();
+        if (!bones) return;
+
+        // Pose contract:
+        //   Values are Euler angles in radians, 'YXZ' order, treated as a DELTA
+        //   composed on top of whatever the baked clip already set on the bone
+        //   (mixer.update() runs before us). bone.quaternion *= setFromEuler(delta).
+        //
+        //   Identity delta [0,0,0] = no-op = baked clip wins. This means the
+        //   widget can ramp procedural amplitude 0→1 without snapping the bone
+        //   to bind pose at amplitude 0 — instead, amplitude 0 just leaves the
+        //   bone at whatever the clip wants for that frame.
+        //
+        //   Postmultiply (clip * delta) rotates the bone in its LOCAL frame
+        //   after the clip's parent inheritance, which is the natural reading
+        //   of "head turns 5° to the right of where the speak clip aimed it".
+        const applyDeltaEulerYXZ = (boneName, eulerXYZ) => {
+            if (!Array.isArray(eulerXYZ) || eulerXYZ.length < 3) return;
+            const bone = bones[boneName];
+            if (!bone) return;
+            tempEulerA.set(eulerXYZ[0], eulerXYZ[1], eulerXYZ[2], 'YXZ');
+            tempQuaternionA.setFromEuler(tempEulerA);
+            bone.quaternion.multiply(tempQuaternionA);
+        };
+
+        // Rig-agnostic application: each pose key IS the bone name (the widget
+        // knows the avatar's rig and provides the right names — DAZ chains like
+        // `head`, `neckUpper`, `neckLower`; FLAME's single `neck`; etc.).
+        // Legacy alias preserved for older callers:
+        //   pose.rotation -> bone 'hip'  (was the global head/body root)
+        // Unknown keys that don't match a bone name are silently skipped.
+        for (const key in pose) {
+            if (!Object.hasOwn(pose, key)) continue;
+            const boneName = (key === 'rotation') ? 'hip' : key;
+            applyDeltaEulerYXZ(boneName, pose[key]);
+        }
     }
 
     /**
@@ -897,6 +1163,8 @@ export class GaussianSplatRenderer {
         this.mixer = new AnimationMixer(skinModel);
         this.animManager = new AnimationManager(this.mixer, aniclip, animationConfig);
         this.motioncfg = motionConfig;
+        // Keep the raw clip list for the clip-preview API.
+        this.clips = Array.isArray(aniclip) ? aniclip : [];
 
         // Set totalFrames from animation clips or default to 1
         if (Array.isArray(aniclip) && aniclip.length > 0 && aniclip[0].duration) {

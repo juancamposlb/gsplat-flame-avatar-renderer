@@ -406,6 +406,29 @@ export class AnimationManager {
 
         this.mixer = mixer;
 
+        // Single-clip mode: when the asset provides exactly one body clip,
+        // every conversational state shares it, so there is no clip state
+        // machine to run — the clip loops continuously and conversational
+        // motion comes from the procedural layers composed on top. State
+        // changes must not touch the action: time resets, LoopOnce clamps,
+        // and crossfades between copies of the clip at different phases all
+        // snap the body pose visibly.
+        this.singleClipMode = !!(animations && animations.length === 1);
+        if (this.singleClipMode) {
+            const action = mixer.clipAction(animations[0]);
+            action.loop = LoopRepeat;
+            action.clampWhenFinished = false;
+            AnimationManager.SetWeight(action, 1.0);
+            action.play();
+            AnimationManager.actions.push(action);
+            this.hello = new Hello([], false);
+            this.idle = new Idle([action], false);
+            this.listen = new Listen([], false);
+            this.think = new Think([], false);
+            this.speak = new Speak([], false);
+            return;
+        }
+
         // Calculate action indices based on config
         const helloIdx = animationcfg?.hello?.size || 0;
         const idleIdx = (animationcfg?.idle?.size || 0) + helloIdx;
@@ -423,16 +446,21 @@ export class AnimationManager {
                     helloActions.push(action);
                 } else if (i < idleIdx) {
                     idleActions.push(action);
-                    // Duplicate for states that share idle
-                    if (listenIdx === idleIdx) {
-                        listenActions.push(mixer.clipAction(clip.clone()));
-                    }
-                    if (speakIdx === listenIdx) {
-                        speakActions.push(mixer.clipAction(clip.clone()));
-                    }
-                    if (thinkIdx === speakIdx) {
-                        thinkActions.push(mixer.clipAction(clip.clone()));
-                    }
+                    // Duplicate for states that share idle. Clones must be
+                    // registered in the global action list like any other
+                    // action — UnPauseAllActions/PauseAllActions iterate it,
+                    // and an unregistered clone that finishes a LoopOnce
+                    // clamp stays paused forever (play() does not unpause),
+                    // freezing the body on re-entry to the state.
+                    const cloneForState = (stateActions) => {
+                        const cloneAction = mixer.clipAction(clip.clone());
+                        stateActions.push(cloneAction);
+                        AnimationManager.actions.push(cloneAction);
+                        AnimationManager.SetWeight(cloneAction, 0);
+                    };
+                    if (listenIdx === idleIdx) cloneForState(listenActions);
+                    if (speakIdx === listenIdx) cloneForState(speakActions);
+                    if (thinkIdx === speakIdx) cloneForState(thinkActions);
                 } else if (i < listenIdx) {
                     listenActions.push(action);
                 } else if (i < speakIdx) {
@@ -529,6 +557,7 @@ export class AnimationManager {
      * @param {string} state - Target state (TYVoiceChatState)
      */
     update(state) {
+        if (this.singleClipMode) return;
         if (AnimationManager.IsBlending) return;
 
         AnimationManager.CurPlaying = this.curPlaying();

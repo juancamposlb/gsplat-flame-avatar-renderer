@@ -223,6 +223,10 @@ export const tempMatrix4A = new Matrix4();
 export const tempMatrix4B = new Matrix4();
 export const tempQuaternionA = new Quaternion();
 export const tempQuaternionB = new Quaternion();
+// Euler order 'YXZ' is the head-stable convention for chain rotations
+// (yaw applied first, then pitch, then roll). See
+// .claude/research/3dmm_transitions_and_state_machine.md §8.
+export const tempEulerA = new Euler(0, 0, 0, 'YXZ');
 
 /**
  * Get pool statistics for all pre-configured pools

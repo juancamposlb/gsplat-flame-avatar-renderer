@@ -67,11 +67,46 @@ export enum WebXRMode {
 }
 
 /**
+ * Per-frame override for FLAME bones driven procedurally by the host application.
+ * Each field is an axis-angle vector (x, y, z) where magnitude = angle in radians.
+ * Omit a field (or return null) to leave the corresponding bone untouched.
+ *
+ * - `neck`     -> FLAME 'neck' bone (bones[1]); use for idle sway, listening lean
+ * - `rotation` -> FLAME root 'hip' bone (bones[0]); global head/torso tilt
+ *
+ * Override semantics are SET (replaces the baked clip rotation for that bone in
+ * the same frame). Mix with the clip on the caller side if delta behavior is
+ * desired.
+ */
+export interface NeckPoseOverride {
+    /**
+     * Each key is a bone name (looked up in the skin.glb skeleton). Value is
+     * Euler 'YXZ' angles in radians [pitch, yaw, roll]. The renderer iterates
+     * all own keys and applies setFromEuler per bone.
+     *
+     * Legacy aliases preserved:
+     *   `rotation` -> bone 'hip' (global head/torso tilt)
+     *
+     * Examples:
+     *   { neck: [0, 0.05, 0] }                          // FLAME 5-bone rig
+     *   { head: [0.1, 0.05, 0], neckUpper: [0.05, 0.025, 0] }  // DAZ chain
+     */
+    [boneName: string]: [number, number, number] | undefined;
+}
+
+/**
  * Options for getInstance
  */
 export interface GaussianSplatRendererOptions {
     getChatState?: () => TYVoiceChatState | string;
     getExpressionData?: () => Record<string, number>;
+    /**
+     * Called once per frame AFTER the AnimationMixer has applied the current
+     * baked clip and BEFORE the splat skinning samples the bones. Return a
+     * partial pose to override specific bones, or null/undefined to keep the
+     * clip values for that frame.
+     */
+    getNeckPose?: () => NeckPoseOverride | null | undefined;
     loadProgress?: (progress: number) => void;
     downloadProgress?: (progress: number) => void;
     backgroundColor?: string;
